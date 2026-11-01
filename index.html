@@ -220,7 +220,7 @@ code{font-family:var(--f-mono);font-size:12px;background:var(--soft);padding:1px
           <div class="meter" aria-hidden="true"><i id="micLevel"></i></div>
           <span class="mic-time" id="micTime" aria-live="off">0:00</span>
         </div>
-        <p class="hint" id="micStatus">Canta, fischia o suona la melodia (fino a 60 secondi), poi premi di nuovo per fermare.</p>
+        <p class="hint" id="micStatus">Canta con «la la la» o fischia la melodia (fino a 60 secondi), poi premi di nuovo per fermare. Le note leggermente stonate vengono corrette.</p>
         <button type="button" id="phoneRecBtn" hidden>Scegli la registrazione</button>
         <input type="file" id="fileRec" accept="audio/*" capture hidden>
       </div>
@@ -261,6 +261,7 @@ code{font-family:var(--f-mono);font-size:12px;background:var(--soft);padding:1px
         <select id="instrument"></select>
       </label>
       <label class="check"><input type="checkbox" id="fitOct" checked> Sposta di ottava nell'estensione dello strumento</label>
+      <label class="check"><input type="checkbox" id="snap" checked> Correggi le note stonate (aggancia alla tonalità)</label>
       <div class="row">
         <label class="f">Titolo<input type="text" id="title" value="Melodia demo"></label>
         <label class="f">Autore<input type="text" id="composer" value=""></label>
@@ -498,7 +499,14 @@ function segmentNotes(frames, gateRel, minNoteMs){
   const hop = HOP/SR;
   let maxDb = -200; frames.forEach(f => { if (f.db > maxDb) maxDb = f.db; });
   const gate = maxDb + gateRel;
-  const raw = frames.map(fr => (fr.f > 0 && fr.db > gate) ? 69 + 12*Math.log2(fr.f/440) : null);
+  const raw0 = frames.map(fr => (fr.f > 0 && fr.db > gate) ? 69 + 12*Math.log2(fr.f/440) : null);
+  // intonazione globale: chi canta è spesso un po' crescente o calante rispetto al La 440
+  // media circolare dello scarto dal semitono (gestisce scarti vicini a ±50 cent)
+  let cs = 0, sn = 0, nv = 0;
+  raw0.forEach(v => { if (v != null){ const a = 2*Math.PI*v; cs += Math.cos(a); sn += Math.sin(a); nv++; } });
+  const tune = nv > 20 && Math.hypot(cs, sn)/nv > 0.2 ? Math.atan2(sn, cs)/(2*Math.PI) : 0;
+  segmentNotes.lastTune = tune;
+  const raw = raw0.map(v => v == null ? null : v - tune);
   const med = raw.map((v,i) => {
     if (v == null) return null;
     const w = []; for (let k=i-2;k<=i+2;k++) if (k>=0 && k<raw.length && raw[k]!=null) w.push(raw[k]);
@@ -540,7 +548,15 @@ function segmentNotes(frames, gateRel, minNoteMs){
     }
     notes.push({start:frames[s].t, end:frames[r.e-1].t + hop, midi:r.p});
   });
-  return notes;
+  // altezza di ogni nota = mediana dei suoi frame (più stabile con vibrato e attacchi incerti)
+  notes.forEach(n => {
+    const v = []; frames.forEach((f, i) => { if (f.t >= n.start && f.t < n.end && raw[i] != null) v.push(raw[i]); });
+    if (v.length >= 3){ v.sort((a,b) => a-b); n.midi = Math.round(v[v.length>>1]); }
+  });
+  // unisci note uguali consecutive nate da scivolamenti
+  const merged = [];
+  notes.forEach(n => { const L = merged[merged.length-1]; if (L && L.midi === n.midi && n.start - L.end < 0.04) L.end = n.end; else merged.push(n); });
+  return merged;
 }
 
 /* ---------- Tempo ---------- */
@@ -599,9 +615,22 @@ function prepareWritten(notes, opts){
 
 function buildAbc(notes, opts){
   const ins = opts.instr;
-  const {concert, octShift, outOfRange} = prepareWritten(notes, opts);
+  let {concert, octShift, outOfRange} = prepareWritten(notes, opts);
   const concertKey = opts.keySel === "auto" ? estimateKey(concert)
     : (([pc,mode]) => keyFrom(+pc, mode))(opts.keySel.split(":"));
+  if (opts.snap){
+    const sc = concertKey.mode === "min" ? [0,2,3,5,7,8,10,11] : [0,2,4,5,7,9,11];
+    const inKey = m => sc.includes(((m - concertKey.pc) % 12 + 12) % 12);
+    let prev = null;
+    concert = concert.map(n => {
+      let m = n.midi;
+      if (!inKey(m)){ const up = inKey(m+1), dn = inKey(m-1); m = up && dn ? (prev != null && prev > m ? m+1 : m-1) : up ? m+1 : m-1; }
+      prev = m; return {...n, midi: m};
+    });
+    const mg = [];
+    concert.forEach(n => { const L = mg[mg.length-1]; if (L && L.midi === n.midi && n.start - L.end < 0.06) L.end = n.end; else mg.push({...n}); });
+    concert = mg;
+  }
   const writtenKey = keyFrom(concertKey.pc + ins.t, concertKey.mode);
   const sp = makeSpeller(writtenKey);
   const written = concert.map(n => ({...n, midi: n.midi + ins.t}));
@@ -611,8 +640,11 @@ function buildAbc(notes, opts){
   const ev = []; let pos = 0;
   if (written.length){
     const t0 = written[0].start;
-    written.forEach(n => {
-      let s = Math.round((n.start-t0)/six/step)*step, e = Math.round((n.end-t0)/six/step)*step;
+    written.forEach((n, idx) => {
+      const nx = written[idx+1];
+      // legato: un piccolo silenzio prima della nota successiva non diventa una pausa
+      const endT = nx && (nx.start - n.end) < 0.45*(60/opts.bpm) ? nx.start : n.end;
+      let s = Math.round((n.start-t0)/six/step)*step, e = Math.round((endT-t0)/six/step)*step;
       if (s < pos) s = pos; if (e <= s) e = s + step;
       if (s > pos) ev.push({rest:true, len:s-pos});
       ev.push({midi:n.midi, len:e-s}); pos = e;
@@ -675,7 +707,7 @@ const prog = p => { $("#prog").style.width = Math.round(p*100) + "%"; };
 
 function opts(){
   return {
-    instr: curInstr(), fitOct: $("#fitOct").checked,
+    instr: curInstr(), fitOct: $("#fitOct").checked, snap: $("#snap").checked,
     title: $("#title").value, composer: $("#composer").value,
     bpm: Math.max(30, Math.min(260, +$("#bpm").value || 96)),
     meter: $("#meter").value, grid: +$("#grid").value,
@@ -745,7 +777,7 @@ async function analyze(){
     status("Segmentazione in note…");
     resegment(true);
     prog(1);
-    status(state.notes.length ? `Fatto: ${state.notes.length} note da ${dur.toFixed(1)} s di audio.` : "Nessuna melodia trovata. Prova ad abbassare la soglia silenzio o alzare la sensibilità.", !state.notes.length);
+    status(state.notes.length ? `Fatto: ${state.notes.length} note da ${dur.toFixed(1)} s di audio.${state.tuneMsg || ""}` : "Nessuna melodia trovata. Prova ad abbassare la soglia silenzio o alzare la sensibilità.", !state.notes.length);
   } catch(e){
     status("Elaborazione non riuscita: " + e.message, true);
   } finally { btn.disabled = false; }
@@ -754,6 +786,8 @@ async function analyze(){
 function resegment(setTempo){
   if (!state.frames) return;
   state.notes = segmentNotes(state.frames, +$("#gate").value, +$("#minNote").value);
+  const cents = Math.round((segmentNotes.lastTune || 0) * 100);
+  state.tuneMsg = Math.abs(cents) >= 8 ? ` Intonazione corretta di ${cents > 0 ? "+" : ""}${cents} cent (${cents > 0 ? "crescente" : "calante"}).` : "";
   const bpm = estimateTempo(state.notes);
   $("#sBpm").textContent = bpm ? bpm + " BPM" : "—";
   state.estBpm = bpm;
@@ -1288,6 +1322,7 @@ async function toggleRec(){
     const blob = new Blob(chunks, {type: mr.mimeType || "audio/webm"});
     const d = new Date(), label = `Registrazione ${d.toLocaleDateString("it-IT")} ${d.toLocaleTimeString("it-IT", {hour:"2-digit", minute:"2-digit"})}`;
     $("#micStatus").classList.remove("err"); $("#micStatus").textContent = "Registrazione completata: la sto trascrivendo.";
+    voicePreset();
     await loadFile(new File([blob], "registrazione", {type: blob.type}), label);
     $("#micStatus").textContent = "Fatto. Premi di nuovo per una nuova registrazione.";
   };
@@ -1303,7 +1338,13 @@ $("#quickRec").addEventListener("click", () => {
   toggleRec();
 });
 $("#phoneRecBtn").addEventListener("click", () => $("#fileRec").click());
-$("#fileRec").addEventListener("change", e => { const f = e.target.files[0]; if (f) loadFile(f, "Registrazione dal telefono"); e.target.value = ""; });
+$("#fileRec").addEventListener("change", e => { const f = e.target.files[0]; if (f){ voicePreset(); loadFile(f, "Registrazione dal telefono"); } e.target.value = ""; });
+// impostazioni adatte alla voce cantata: niente note-lampo, ritmo più semplice, note agganciate alla tonalità
+function voicePreset(){
+  if (+$("#minNote").value < 120){ $("#minNote").value = 120; $("#minNoteOut").textContent = "120 ms"; }
+  $("#grid").value = "2"; $("#snap").checked = true;
+  if (+$("#thr").value < 0.2){ $("#thr").value = 0.2; $("#thrOut").textContent = "0.20"; }
+}
 
 const drop = $("#drop"), fileIn = $("#file");
 drop.addEventListener("click", () => fileIn.click());
@@ -1319,7 +1360,7 @@ $("#runBtn").addEventListener("click", analyze);
   $(i).addEventListener("input", () => { $(o).textContent = fmt($(i).value); });
 });
 ["#gate","#minNote"].forEach(s => $(s).addEventListener("change", () => { if (state.frames){ if (state.dirty){ $("#regenBar").hidden = false; return; } resegment(false); } }));
-["#instrument","#fitOct","#bpm","#meter","#grid","#keySel","#transpose","#title","#composer"].forEach(s =>
+["#instrument","#fitOct","#snap","#bpm","#meter","#grid","#keySel","#transpose","#title","#composer"].forEach(s =>
   $(s).addEventListener("change", () => regenerate(false)));
 $("#estBtn").addEventListener("click", () => { if (state.estBpm){ $("#bpm").value = state.estBpm; regenerate(false); } });
 $("#regenBtn").addEventListener("click", () => { state.dirty = false; if (state.frames) resegment(false); else regenerate(true); });
